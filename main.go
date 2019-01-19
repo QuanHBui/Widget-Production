@@ -1,7 +1,7 @@
 //==============================================================================
 // Project name: Widget Production line
 // Author: Quan Bui
-// Date: 12/26/2018
+// Date: 01/14/2019
 // File: main.go
 //==============================================================================
 
@@ -23,14 +23,14 @@ const TIME_FORMAT = "15:04:05.000000"
 
 var wg sync.WaitGroup
 
-type widget struct {
+//==============================================================================
+type Widget struct {
     id      string      // Universally unique
-    source  string      // Which producer created this widget
-    time    time.Time   // Time set by producer when widget was created
+    source  string      // Which Producer created this Widget
+    time    time.Time   // Time set by Producer when Widget was created
     broken  bool        // Widget is broken or not
 }
 
-//=============================================================================
 func idMaker() string {
     var buffer bytes.Buffer
 
@@ -44,181 +44,145 @@ func idMaker() string {
     return buffer.String()
 }
 
-type producer struct {
+//==============================================================================
+type Producer struct {
     name        string
-    numWidgets  int
 }
 
-// The process when a producer produces a widget
-func produce(prod producer, broken bool) widget {
-    toReturnWidget := widget{idMaker(), prod.name, time.Now(), broken}
-    //fmt.Printf("Producing [id=%s source=%s time=%s broken=%t]\n",
-    //toReturnWidget.id, toReturnWidget.source, toReturnWidget.time.Format(TIME_FORMAT), toReturnWidget.broken)
-    return toReturnWidget
+// The process when a Producer produces a Widget
+func (prod Producer) produce(broken bool) Widget {
+    return Widget{idMaker(), prod.name, time.Now(), broken}
 }
 
-//=============================================================================
-type consumer struct {
-    name    string
-}
+// jobChannel will be used to keep track of how many widgets got produced, and which widget is broken
+func productionLine(producerTable []Producer, numWidgets int, numKth int, jobChannel <-chan int, outWidgetChannel chan<- Widget, quitChannel <-chan struct{}) {
+    defer wg.Done()
+    defer close(outWidgetChannel)
+    var productionWaitGroup sync.WaitGroup
 
-func consume(con consumer, wid widget) bool{
-    fmt.Printf("%s ", con.name)
-    if !wid.broken {
-        fmt.Printf("consumes")
-    } else {
-        fmt.Printf("found a broken widget ")
+    productionWaitGroup.Add(len(producerTable))
+    for _, workingProducer := range producerTable {
+        go func(workingProducer Producer) {
+            defer productionWaitGroup.Done()
+            for i := range jobChannel {
+                select {
+                default:
+                    if (numKth == i) {
+                        // Produce broken widget if i = numKth
+                        outWidgetChannel <- workingProducer.produce(true)
+                    } else {
+                        outWidgetChannel <- workingProducer.produce(false)
+                    }
+                case <-quitChannel:
+                    return
+                }
+            }
+        }(workingProducer)
     }
-    fmt.Printf("[id=%s source=%s time=%s ", wid.id, wid.source, wid.time.Format(TIME_FORMAT))
-    if !wid.broken {
-        fmt.Printf("broken=%t] in %s time\n", wid.broken, time.Since(wid.time))
-    } else {
-        fmt.Printf("broken=%t] -- stopping production\n", wid.broken)
-    }
+    productionWaitGroup.Wait()
+}
 
+//==============================================================================
+type Consumer struct {
+    name string
+}
+
+func (con Consumer) consume(wid Widget) bool {
+    if !wid.broken {
+        fmt.Printf("%s consumes [id=%s source=%s time=%s broken=%t] in %s time\n",
+            con.name, wid.id, wid.source, wid.time.Format(TIME_FORMAT), wid.broken, time.Since(wid.time))
+    } else {
+        fmt.Printf("%s found a broken widget [id=%s source=%s time=%s broken=%t] -- stopping production\n",
+            con.name, wid.id, wid.source, wid.time.Format(TIME_FORMAT), wid.broken)
+    }
     return wid.broken
 }
 
+// Consumer will quit working once the widgetChannel is closed
+func consumptionLine(consumerTable []Consumer, inWidgetChannel <-chan Widget, brokenWidgetChannel chan<- struct{}) {
+    defer wg.Done()
+    var consumptionWaitGroup sync.WaitGroup
+    doneChannel := make(chan struct{})
+
+    consumptionWaitGroup.Add(len(consumerTable))
+    for _, workingConsumer := range consumerTable {
+        go func(workingConsumer Consumer) {
+            defer consumptionWaitGroup.Done()
+            for workingWidget := range inWidgetChannel {
+                select {
+                case <-doneChannel:
+                    return
+                default:
+                    if (workingConsumer.consume(workingWidget)) {
+                        close(brokenWidgetChannel)      // brokenWidgetChannel used to signify a broken widget has been encountered
+                        close(doneChannel)              // doneChannel to let the rest of the consumers knows that they need to stop
+                        return
+                    }
+                }
+            }
+        }(workingConsumer)
+    }
+    consumptionWaitGroup.Wait()
+}
+
 //=============================================================================
-// ProductionLine should be a producer produces following by a consumer consumes
-func widgetProductionLine(widgetTable []widget, numWidgets int, numProducers int, numConsumers int, numKth int) {
-    var producerTable []producer
-    // Make all the producers first
-    for i:= 0; i < numProducers; i++ {
+// ProductionLine should be a Producer produces following by a consumer consumes
+func WidgetProductionConsumptionLine(numWidgets int, numProducers int, numConsumers int, numKth int) {
+    // Make all the Producers first
+    var producerTable []Producer
+    for i := 0; i < numProducers; i++ {
         var buffer bytes.Buffer
         buffer.WriteString("producer_")
         buffer.WriteString(strconv.Itoa(i))
-        producerTable = append(producerTable, producer{buffer.String(), 0})
+        producerTable = append(producerTable, Producer{buffer.String()})
     }
 
-    var consumerTable []consumer
-    // Make all the consumers 
-    for i:= 0; i < numConsumers; i++ {
+    // Make all the consumers
+    var consumerTable []Consumer
+    for i := 0; i < numConsumers; i++ {
         var buffer bytes.Buffer
         buffer.WriteString("consumer_")
         buffer.WriteString(strconv.Itoa(i))
-        consumerTable = append(consumerTable, consumer{buffer.String()})
-    }
-    brokenWidgetConsumed := false                   // Bool var indicates if brokenWidget is consumed 
-    brokenWidgetChannel := make(chan bool)          // This channel used to signal when broken widget is produced
-    productionCounterChannel := make(chan int)      // This channel used to pass the production counter
-    consumptionCounterChannel := make(chan int)     // This channel used for pass consumption counter
-    quitChannel := make(chan bool, len(producerTable) + len(consumerTable))   // This buffered channel used to send quit signal(s) 
-    widgetChannel := make(chan widget)
-
-    // Initialization of the brokenWidgetChannel
-    go func() {
-        wg.Add(1)
-        if numKth == 0 {
-            brokenWidgetChannel <- true
-        }   else {
-            brokenWidgetChannel <- false
-        }
-        wg.Done()
-    }()
-
-    // Multithreading production line
-    for j := 0; j < len(producerTable); j++ {
-        //fmt.Println("j=", j)
-
-        wg.Add(1)
-        go func(j int) {
-            for {
-                select {
-                case <-quitChannel:
-                    //fmt.Printf("Production line %d is shutting down...\n", j)
-                    wg.Done()
-                    return
-                case broken := <-brokenWidgetChannel:
-                    workingWidget := produce(producerTable[j], broken)
-                    widgetTable = append(widgetTable, workingWidget)
-                    productionCounterChannel <- 1
-                    widgetChannel <- workingWidget      // Sending the widget for consumption
-                default:
-                    //fmt.Println("No signal from brokenWidgetChannel.")
-                }
-            }
-        }(j)
+        consumerTable = append(consumerTable, Consumer{buffer.String()})
     }
 
-    // Multithreading consumption line
-    for k := 0; k < len(consumerTable); k++ {
-        //fmt.Println("k=", k)
+    jobChannel := make(chan int, numWidgets)        // Job channel to keep track of how many widgets produced and which widget would be broken
+    widgetChannel := make(chan Widget, numWidgets)  // Widget channel to send to consumers to consume
+    quitChannel := make(chan struct{})              // To signify when the consumptionLine and productionLine will quit
+    brokenWidgetChannel := make(chan struct{})      // Written by a consumer when a broken widget is met
 
-        wg.Add(1)
-        go func(k int) {
-            for {
-                select {
-                case <-quitChannel:
-                    //fmt.Printf("Consumption line %d is shutting down...\n", k)
-                    wg.Done()
-                    return
-                case widget := <-widgetChannel:
-                    if consume(consumerTable[k], widget) {
-                        brokenWidgetConsumed = true
-                    }
-                    consumptionCounterChannel <- 1
-                default:
-                    //fmt.Println("widgetChannel empty. Waiting for widget to be produced")
-                }
-            }
-        }(k)
+    // Rack up all the jobs first
+    for i := 1; i <= numWidgets; i++ {
+        jobChannel <- i
     }
+    close(jobChannel)
 
-    // Production Manager. This doesn't have to be a goroutine
-    // Needs to constantly checking if counter exceeds numWidgets
-    productionCounter := 0
-    consumptionCounter := 0
-    for {
-        productionCounter += <-productionCounterChannel
-        consumptionCounter += <-consumptionCounterChannel
-        //fmt.Printf("Producing %d widgets.\n", productionCounter)
-        //fmt.Printf("Consuming %d widgets.\n", consumptionCounter)
+    wg.Add(2)
+    // Producers will then grab job requests from jobChannel and produce
+    go productionLine(producerTable, numWidgets, numKth, jobChannel, widgetChannel, quitChannel)
 
-        // Signaling when to stop: 
-        // - When all widgets are produced by producers AND when all widgets are consumed by consumers
-        // - OR When a broken widget is consumed (HIGHEST PRIORITY)
-        if brokenWidgetConsumed || (productionCounter == numWidgets && consumptionCounter == numWidgets) {
-            //fmt.Println("Sending quit signals")
-            for i := 0; i < len(producerTable) + len(consumerTable); i++ {
-                quitChannel <- true
-            }
+    // Consumers grabbing widgets from widget channel and consume
+    go consumptionLine(consumerTable, widgetChannel, brokenWidgetChannel)
 
-            // Closing all channels, except for quitChannel
-            //fmt.Println("Closing all channels")
-            fmt.Println("[execution stops]")
-            close(productionCounterChannel)
-            close(consumptionCounterChannel)
-            close(brokenWidgetChannel)
-            close(widgetChannel)
-            break
-        }
-
-        // Signaling if the widget will be broken when produced
-        if productionCounter == numKth {
-            brokenWidgetChannel <- true
-        } else {
-            brokenWidgetChannel <- false
-        }
+    // When brokenWidgetChannel is closed by a consumer, this will close the quitChannel to tell consumptionLine and productionLine to stop
+    if (numKth > 0) {
+        <-brokenWidgetChannel
+        fmt.Println("[execution stops]")
+        close(quitChannel)
     }
+    wg.Wait()
 }
 
 func main() {
+    timeBegin := time.Now()
     rand.Seed(time.Now().UnixNano())
 
-    var numWidgets = flag.Int("n", 10, "Sets the number of widgets created")
-    var numProducers = flag.Int("p", 1, "Sets the number of producers created")
+    var numWidgets = flag.Int("n", 10, "Sets the number of Widgets created")
+    var numProducers = flag.Int("p", 1, "Sets the number of Producers created")
     var numConsumers = flag.Int("c", 1, "Sets the number of consumers created")
-    var numKth = flag.Int("k", -1, "Sets the kth widget to be broken")
+    var numKth = flag.Int("k", -1, "Sets the kth Widget to be broken")
     flag.Parse()
 
-    var widgetProductionTable []widget
-
-    //fmt.Println("numWidgets:", *numWidgets)
-    //fmt.Println("numProducers:", *numProducers)
-    //fmt.Println("numConsumers:", *numConsumers)
-    //fmt.Println("numKth:", *numKth)
-
-    widgetProductionLine(widgetProductionTable, *numWidgets, *numProducers, *numConsumers, *numKth - 1)
-    wg.Wait()
+    WidgetProductionConsumptionLine(*numWidgets, *numProducers, *numConsumers, *numKth)
+    fmt.Printf("The program took [ %s ] to finish.\n", time.Since(timeBegin).String())
 }
