@@ -1,5 +1,5 @@
 # WidgetProduction
-Small project to learn golang
+Small project to learn golang.
 This was used as a small project for the interview for PlatoApp backend engineer position. 
 
 # exercise
